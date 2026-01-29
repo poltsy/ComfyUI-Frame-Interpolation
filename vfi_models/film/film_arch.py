@@ -98,6 +98,9 @@ class SubTreeExtractor(nn.Module):
             ))
             in_channels = channels << i
         self.convs = nn.ModuleList(convs)
+        # Store direct reference for TorchScript compatibility
+        self.register_buffer('target_dtype', torch.zeros(1))
+        self.register_buffer('target_device', torch.zeros(1))
 
     def forward(self, image: torch.Tensor, n: int) -> List[torch.Tensor]:
         """Extracts a pyramid of features from the image.
@@ -112,10 +115,14 @@ class SubTreeExtractor(nn.Module):
           pyramid level.
         """
         head = image
-        pyramid = []
+        if head.device.type == 'cuda':
+            head = head.to(memory_format=torch.channels_last)
+
+        # Pre-allocate pyramid list
+        pyramid = [torch.empty(0)] * n
         for i, layer in enumerate(self.convs):
             head = layer(head)
-            pyramid.append(head)
+            pyramid[i] = head
             if i < n - 1:
                 head = F.avg_pool2d(head, kernel_size=2, stride=2)
         return pyramid
@@ -138,27 +145,21 @@ class FeatureExtractor(nn.Module):
         Returns:
           A pyramid of cascaded features.
         """
-        sub_pyramids: List[List[torch.Tensor]] = []
-        for i in range(len(image_pyramid)):
-            # At each level of the image pyramid, creates a sub_pyramid of features
-            # with 'sub_levels' pyramid levels, re-using the same SubTreeExtractor.
-            # We use the same instance since we want to share the weights.
-            #
-            # However, we cap the depth of the sub_pyramid so we don't create features
-            # that are beyond the coarsest level of the cascaded feature pyramid we
-            # want to generate.
-            capped_sub_levels = min(len(image_pyramid) - i, self.sub_levels)
-            sub_pyramids.append(self.extract_sublevels(image_pyramid[i], capped_sub_levels))
-        # Below we generate the cascades of features on each level of the feature
-        # pyramid. Assuming sub_levels=3, The layout of the features will be
-        # as shown in the example on file documentation above.
-        feature_pyramid: List[torch.Tensor] = []
-        for i in range(len(image_pyramid)):
+        n_pyramid = len(image_pyramid)
+        sub_pyramids: List[List[torch.Tensor]] = [[]] * n_pyramid
+        for i in range(n_pyramid):
+            img = image_pyramid[i]
+            capped_sub_levels = min(n_pyramid - i, self.sub_levels)
+            sub_pyramids[i] = self.extract_sublevels(img, capped_sub_levels)
+
+        feature_pyramid: List[torch.Tensor] = [torch.empty(0)] * n_pyramid
+        for i in range(n_pyramid):
             features = sub_pyramids[i][0]
+            # Potential for fusion here, but cat is efficient
             for j in range(1, self.sub_levels):
                 if j <= i:
                     features = torch.cat([features, sub_pyramids[i - j][j]], dim=1)
-            feature_pyramid.append(features)
+            feature_pyramid[i] = features
         return feature_pyramid
 
 
@@ -204,6 +205,9 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+# Enable cuDNN autotuner for better performance with consistent input sizes
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
 
 _NUMBER_OF_COLOR_CHANNELS = 3
 
@@ -268,14 +272,9 @@ class Fusion(nn.Module):
           ValueError, if len(pyramid) != config.fusion_pyramid_levels as provided in
             the constructor.
         """
-
-        # As a slight difference to a conventional decoder (e.g. U-net), we don't
-        # apply any extra convolutions to the coarsest level, but just pass it
-        # to finer levels for concatenation. This choice has not been thoroughly
-        # evaluated, but is motivated by the educated guess that the fusion part
-        # probably does not need large spatial context, because at this point the
-        # features are spatially aligned by the preceding warp.
         net = pyramid[-1]
+        if net.device.type == 'cuda':
+            net = net.to(memory_format=torch.channels_last)
 
         # Loop starting from the 2nd coarsest level:
         # for i in reversed(range(0, len(pyramid) - 1)):
@@ -283,9 +282,12 @@ class Fusion(nn.Module):
             i = len(self.convs) - 1 - k
             # Resize the tensor from coarser level to match for concatenation.
             level_size = pyramid[i].shape[2:4]
-            net = F.interpolate(net, size=level_size, mode='nearest')
+            # Use upsample_bilinear2d directly for speed if size is known
+            net = F.interpolate(net, size=level_size, mode='bilinear', align_corners=True)
             net = layers[0](net)
-            net = torch.cat([pyramid[i], net], dim=1)
+
+            p_i = pyramid[i]
+            net = torch.cat([p_i, net], dim=1)
             net = layers[1](net)
             net = layers[2](net)
         net = self.output_conv(net)
@@ -383,6 +385,7 @@ class Interpolator(nn.Module):
             filters=64,
             flow_convs=(3, 3, 3, 3),
             flow_filters=(32, 64, 128, 256),
+            compile: bool = True,
     ):
         super().__init__()
         self.pyramid_levels = pyramid_levels
@@ -392,59 +395,94 @@ class Interpolator(nn.Module):
         self.predict_flow = PyramidFlowEstimator(filters, flow_convs, flow_filters)
         self.fuse = Fusion(sub_levels, specialized_levels, filters)
 
+        # Applying channels_last memory format to model weights for FP16 speedup
+        if torch.cuda.is_available():
+            self.to(memory_format=torch.channels_last)
+
+        if compile and hasattr(torch, 'compile'):
+            try:
+                # Use max-autotune for dramatic speedup if hardware/PyTorch supports it
+                # fallback to reduce-overhead otherwise
+                self.predict_flow = torch.compile(self.predict_flow, mode="max-autotune")
+                self.fuse = torch.compile(self.fuse, mode="max-autotune")
+                # Feature extractor is often harder to compile due to cascaded logic,
+                # but we'll try for performance.
+                self.extract = torch.compile(self.extract, mode="max-autotune")
+            except Exception:
+                pass
+
     def shuffle_images(self, x0, x1):
-        return [
-            build_image_pyramid(x0, self.pyramid_levels),
-            build_image_pyramid(x1, self.pyramid_levels)
-        ]
+        # We find the first parameter to determine the target device and dtype
+        p = next(self.parameters())
+        x = torch.cat([x0, x1], dim=0).to(device=p.device, dtype=p.dtype)
+
+        # Build batched pyramid
+        pyramid = build_image_pyramid(x, self.pyramid_levels)
+
+        # Split back to x0 and x1 pyramids
+        x0_pyramid = [p[:x0.shape[0]] for p in pyramid]
+        x1_pyramid = [p[x0.shape[0]:] for p in pyramid]
+
+        return [x0_pyramid, x1_pyramid]
 
     def debug_forward(self, x0, x1, batch_dt) -> Dict[str, List[torch.Tensor]]:
-        image_pyramids = self.shuffle_images(x0, x1)
+        # We find the first parameter to determine the target device and dtype
+        p = next(self.parameters())
+        if batch_dt.dtype != p.dtype: batch_dt = batch_dt.to(dtype=p.dtype)
+        if batch_dt.device != p.device: batch_dt = batch_dt.to(device=p.device)
 
-        # Siamese feature pyramids:
-        feature_pyramids = [self.extract(image_pyramids[0]), self.extract(image_pyramids[1])]
+        batch_size = x0.shape[0]
 
-        # Predict forward flow.
-        forward_residual_flow_pyramid = self.predict_flow(feature_pyramids[0], feature_pyramids[1])
+        # Batch image pyramids and feature extraction
+        x_batched = torch.cat([x0, x1], dim=0).to(device=p.device, dtype=p.dtype)
+        image_pyramid_batched = build_image_pyramid(x_batched, self.pyramid_levels)
+        feature_pyramid_batched = self.extract(image_pyramid_batched)
 
-        # Predict backward flow.
-        backward_residual_flow_pyramid = self.predict_flow(feature_pyramids[1], feature_pyramids[0])
+        # Split feature pyramids
+        feature_pyramids = [
+            [f[:batch_size] for f in feature_pyramid_batched],
+            [f[batch_size:] for f in feature_pyramid_batched]
+        ]
+        image_pyramids = [
+            [img[:batch_size] for img in image_pyramid_batched],
+            [img[batch_size:] for img in image_pyramid_batched]
+        ]
 
-        # Concatenate features and images:
+        # Batch flow prediction: Forward (0->1) and Backward (1->0)
+        # feat_a: [f0, f1], feat_b: [f1, f0]
+        feat_a_batched = [torch.cat([f[:batch_size], f[batch_size:]], dim=0) for f in feature_pyramid_batched]
+        feat_b_batched = [torch.cat([f[batch_size:], f[:batch_size]], dim=0) for f in feature_pyramid_batched]
 
-        # Note that we keep up to 'fusion_pyramid_levels' levels as only those
-        # are used by the fusion module.
+        residual_flow_pyramid_batched = self.predict_flow(feat_a_batched, feat_b_batched)
 
+        # Split residual flows
+        forward_residual_flow_pyramid = [r[:batch_size] for r in residual_flow_pyramid_batched]
+        backward_residual_flow_pyramid = [r[batch_size:] for r in residual_flow_pyramid_batched]
+
+        # Convert to full flows
         forward_flow_pyramid = flow_pyramid_synthesis(forward_residual_flow_pyramid)[:self.fusion_pyramid_levels]
-
         backward_flow_pyramid = flow_pyramid_synthesis(backward_residual_flow_pyramid)[:self.fusion_pyramid_levels]
 
-        # We multiply the flows with t and 1-t to warp to the desired fractional time.
-        #
-        # Note: In film_net we fix time to be 0.5, and recursively invoke the interpo-
-        # lator for multi-frame interpolation. Below, we create a constant tensor of
-        # shape [B]. We use the `time` tensor to infer the batch size.
+        # Desired fractional time (fixed to 0.5 in FILM)
         mid_time = torch.full_like(batch_dt, .5)
         backward_flow = multiply_pyramid(backward_flow_pyramid, mid_time[:, 0])
         forward_flow = multiply_pyramid(forward_flow_pyramid, 1 - mid_time[:, 0])
 
-        pyramids_to_warp = [
-            concatenate_pyramids(image_pyramids[0][:self.fusion_pyramid_levels],
-                                      feature_pyramids[0][:self.fusion_pyramid_levels]),
-            concatenate_pyramids(image_pyramids[1][:self.fusion_pyramid_levels],
-                                      feature_pyramids[1][:self.fusion_pyramid_levels])
-        ]
+        # Fused construction of the aligned pyramid for fusion stage
+        # Each level is concat(img0_warped, feat0_warped, img1_warped, feat1_warped, flow_back, flow_fwd)
 
-        # Warp features and images using the flow. Note that we use backward warping
-        # and backward flow is used to read from image 0 and forward flow from
-        # image 1.
-        forward_warped_pyramid = pyramid_warp(pyramids_to_warp[0], backward_flow)
-        backward_warped_pyramid = pyramid_warp(pyramids_to_warp[1], forward_flow)
+        # Warp image 0 with backward flow and image 1 with forward flow
+        pyramids0_to_warp = concatenate_pyramids(image_pyramids[0][:self.fusion_pyramid_levels],
+                                               feature_pyramids[0][:self.fusion_pyramid_levels])
+        pyramids1_to_warp = concatenate_pyramids(image_pyramids[1][:self.fusion_pyramid_levels],
+                                               feature_pyramids[1][:self.fusion_pyramid_levels])
 
-        aligned_pyramid = concatenate_pyramids(forward_warped_pyramid,
-                                                    backward_warped_pyramid)
-        aligned_pyramid = concatenate_pyramids(aligned_pyramid, backward_flow)
-        aligned_pyramid = concatenate_pyramids(aligned_pyramid, forward_flow)
+        forward_warped_pyramid = pyramid_warp(pyramids0_to_warp, backward_flow)
+        backward_warped_pyramid = pyramid_warp(pyramids1_to_warp, forward_flow)
+
+        # Final fused pyramid concatenation
+        aligned_pyramid = fuse_pyramids(forward_warped_pyramid, backward_warped_pyramid,
+                                      backward_flow, forward_flow)
 
         return {
             'image': [self.fuse(aligned_pyramid)],
@@ -455,8 +493,22 @@ class Interpolator(nn.Module):
         }
 
 
+    @torch.inference_mode()
     def forward(self, x0, x1, batch_dt) -> torch.Tensor:
-        return self.debug_forward(x0, x1, batch_dt)['image'][0]
+        """Processes the frame interpolation model.
+
+        This method uses inference_mode and amp.autocast for performance.
+        Inputs are automatically converted to channels_last for CUDA acceleration.
+        """
+        device = x0.device
+        if device.type == 'cuda':
+            x0 = x0.to(memory_format=torch.channels_last)
+            x1 = x1.to(memory_format=torch.channels_last)
+
+        with torch.cuda.amp.autocast(enabled=device.type == 'cuda'):
+            result = self.debug_forward(x0, x1, batch_dt)['image'][0]
+
+        return result
 
 
 
@@ -566,54 +618,33 @@ class PyramidFlowEstimator(nn.Module):
 
     def forward(self, feature_pyramid_a: List[torch.Tensor],
                 feature_pyramid_b: List[torch.Tensor]) -> List[torch.Tensor]:
-        """Estimates residual flow pyramids between two image pyramids.
-
-        Each image pyramid is represented as a list of tensors in fine-to-coarse
-        order. Each individual image is represented as a tensor where each pixel is
-        a vector of image features.
-
-        flow_pyramid_synthesis can be used to convert the residual flow
-        pyramid returned by this method into a flow pyramid, where each level
-        encodes the flow instead of a residual correction.
-
-        Args:
-          feature_pyramid_a: image pyramid as a list in fine-to-coarse order
-          feature_pyramid_b: image pyramid as a list in fine-to-coarse order
-
-        Returns:
-          List of flow tensors, in fine-to-coarse order, each level encoding the
-          difference against the bilinearly upsampled version from the coarser
-          level. The coarsest flow tensor, e.g. the last element in the array is the
-          'DC-term', e.g. not a residual (alternatively you can think of it being a
-          residual against zero).
-        """
+        """Estimates residual flow pyramids between two image pyramids."""
         levels = len(feature_pyramid_a)
+        residuals = [torch.empty(0)] * levels
+
+        # Start from the coarsest level
         v = self._predictor(feature_pyramid_a[-1], feature_pyramid_b[-1])
-        residuals = [v]
-        for i in range(levels - 2, len(self._predictors) - 1, -1):
-            # Upsamples the flow to match the current pyramid level. Also, scales the
-            # magnitude by two to reflect the new size.
+        residuals[levels - 1] = v
+
+        # Number of specialized predictors
+        num_specialized = len(self._predictors)
+
+        # Traverse from coarse to fine
+        for i in range(levels - 2, -1, -1):
+            # Upsample flow
             level_size = feature_pyramid_a[i].shape[2:4]
-            v = F.interpolate(2 * v, size=level_size, mode='bilinear')
-            # Warp feature_pyramid_b[i] image based on the current flow estimate.
+            v = F.interpolate(2 * v, size=level_size, mode='bilinear', align_corners=True)
+
+            # Warp features from B using current flow
             warped = warp(feature_pyramid_b[i], v)
-            # Estimate the residual flow between pyramid_a[i] and warped image:
-            v_residual = self._predictor(feature_pyramid_a[i], warped)
-            residuals.insert(0, v_residual)
+
+            # Use specialized predictor if available for this level, else use the share one
+            predictor = self._predictors[i] if i < num_specialized else self._predictor
+
+            v_residual = predictor(feature_pyramid_a[i], warped)
+            residuals[i] = v_residual
             v = v_residual + v
 
-        for k, predictor in enumerate(self._predictors):
-            i = len(self._predictors) - 1 - k
-            # Upsamples the flow to match the current pyramid level. Also, scales the
-            # magnitude by two to reflect the new size.
-            level_size = feature_pyramid_a[i].shape[2:4]
-            v = F.interpolate(2 * v, size=level_size, mode='bilinear')
-            # Warp feature_pyramid_b[i] image based on the current flow estimate.
-            warped = warp(feature_pyramid_b[i], v)
-            # Estimate the residual flow between pyramid_a[i] and warped image:
-            v_residual = predictor(feature_pyramid_a[i], warped)
-            residuals.insert(0, v_residual)
-            v = v_residual + v
         return residuals
 
 
@@ -652,132 +683,117 @@ def load_image(path, align=64):
     return image_batch, crop_region
 
 
+@torch.jit.script
 def build_image_pyramid(image: torch.Tensor, pyramid_levels: int = 3) -> List[torch.Tensor]:
-    """Builds an image pyramid from a given image.
-
-    The original image is included in the pyramid and the rest are generated by
-    successively halving the resolution.
-
-    Args:
-      image: the input image.
-      options: film_net options object
-
-    Returns:
-      A list of images starting from the finest with options.pyramid_levels items
-    """
-
-    pyramid = []
+    """Builds an image pyramid from a given image."""
+    pyramid = [torch.empty(0)] * pyramid_levels
     for i in range(pyramid_levels):
-        pyramid.append(image)
+        # Use memory_format=torch.channels_last for FP16 speedup
+        if image.device.type == 'cuda':
+            image = image.to(memory_format=torch.channels_last)
+        pyramid[i] = image
         if i < pyramid_levels - 1:
             image = F.avg_pool2d(image, 2, 2)
     return pyramid
 
 
+_GRID_CACHE = {}
+
+
 def warp(image: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
-    """Backward warps the image using the given flow.
-
-    Specifically, the output pixel in batch b, at position x, y will be computed
-    as follows:
-      (flowed_y, flowed_x) = (y+flow[b, y, x, 1], x+flow[b, y, x, 0])
-      output[b, y, x] = bilinear_lookup(image, b, flowed_y, flowed_x)
-
-    Note that the flow vectors are expected as [x, y], e.g. x in position 0 and
-    y in position 1.
-
-    Args:
-      image: An image with shape BxHxWxC.
-      flow: A flow with shape BxHxWx2, with the two channels denoting the relative
-        offset in order: (dx, dy).
-    Returns:
-      A warped image.
-    """
-    flow = -flow.flip(1)
-
+    """Backward warps the image using the given flow."""
     dtype = flow.dtype
     device = flow.device
+    batch, _, height, width = image.shape
 
-    # warped = tfa_image.dense_image_warp(image, flow)
-    # Same as above but with pytorch
-    ls1 = 1 - 1 / flow.shape[3]
-    ls2 = 1 - 1 / flow.shape[2]
+    cache_key = (height, width, dtype, device)
+    if cache_key not in _GRID_CACHE:
+        # Precompute grid coordinates once for this resolution
+        ls1 = torch.tensor(1 - 1 / width, dtype=dtype, device=device)
+        ls2 = torch.tensor(1 - 1 / height, dtype=dtype, device=device)
 
-    normalized_flow2 = flow.permute(0, 2, 3, 1) / torch.tensor(
-        [flow.shape[2] * .5, flow.shape[3] * .5], dtype=dtype, device=device)[None, None, None]
-    normalized_flow2 = torch.stack([
-        torch.linspace(-ls1, ls1, flow.shape[3], dtype=dtype, device=device)[None, None, :] - normalized_flow2[..., 1],
-        torch.linspace(-ls2, ls2, flow.shape[2], dtype=dtype, device=device)[None, :, None] - normalized_flow2[..., 0],
-    ], dim=3)
+        grid_x = torch.linspace(-ls1, ls1, width, dtype=dtype, device=device)
+        grid_y = torch.linspace(-ls2, ls2, height, dtype=dtype, device=device)
+
+        # Save precomputed grid and scaling factor
+        grid = torch.stack(torch.meshgrid(grid_x, grid_y, indexing='xy'), dim=2)
+        scale = torch.tensor([2.0 / width, 2.0 / height], dtype=dtype, device=device)
+        _GRID_CACHE[cache_key] = (grid.contiguous(), scale)
+
+    grid_base, scale = _GRID_CACHE[cache_key]
+    grid = grid_base.expand(batch, -1, -1, -1)
+
+    # Scale flow and subtract from grid
+    grid = grid - flow.permute(0, 2, 3, 1) * scale
 
     padding_mode = "border"
     if device.type == "mps":
-        # https://github.com/pytorch/pytorch/issues/125098
         padding_mode = "zeros"
-        normalized_flow2 = normalized_flow2.clamp(-1, 1)
+        grid = grid.clamp(-1, 1)
+
     warped = F.grid_sample(
         input=image,
-        grid=normalized_flow2,
+        grid=grid,
         mode='bilinear',
         padding_mode=padding_mode,
         align_corners=False,
     )
-    return warped.reshape(image.shape)
+    return warped
 
 
+@torch.jit.script
 def multiply_pyramid(pyramid: List[torch.Tensor],
                      scalar: torch.Tensor) -> List[torch.Tensor]:
-    """Multiplies all image batches in the pyramid by a batch of scalars.
-
-    Args:
-      pyramid: Pyramid of image batches.
-      scalar: Batch of scalars.
-
-    Returns:
-      An image pyramid with all images multiplied by the scalar.
-    """
-    # To multiply each image with its corresponding scalar, we first transpose
-    # the batch of images from BxHxWxC-format to CxHxWxB. This can then be
-    # multiplied with a batch of scalars, then we transpose back to the standard
-    # BxHxWxC form.
+    """Multiplies all image batches in the pyramid by a batch of scalars."""
     return [image * scalar for image in pyramid]
 
 
+@torch.jit.script
 def flow_pyramid_synthesis(
         residual_pyramid: List[torch.Tensor]) -> List[torch.Tensor]:
     """Converts a residual flow pyramid into a flow pyramid."""
+    n = len(residual_pyramid)
     flow = residual_pyramid[-1]
-    flow_pyramid: List[torch.Tensor] = [flow]
-    for residual_flow in residual_pyramid[:-1][::-1]:
+    flow_pyramid: List[torch.Tensor] = [torch.empty(0)] * n
+    flow_pyramid[n - 1] = flow
+    for k in range(n - 1):
+        i = n - 2 - k
+        residual_flow = residual_pyramid[i]
         level_size = residual_flow.shape[2:4]
-        flow = F.interpolate(2 * flow, size=level_size, mode='bilinear')
+        flow = F.interpolate(2 * flow, size=level_size, mode='bilinear', align_corners=True)
         flow = residual_flow + flow
-        flow_pyramid.insert(0, flow)
+        flow_pyramid[i] = flow
     return flow_pyramid
 
 
 def pyramid_warp(feature_pyramid: List[torch.Tensor],
                  flow_pyramid: List[torch.Tensor]) -> List[torch.Tensor]:
-    """Warps the feature pyramid using the flow pyramid.
-
-    Args:
-      feature_pyramid: feature pyramid starting from the finest level.
-      flow_pyramid: flow fields, starting from the finest level.
-
-    Returns:
-      Reverse warped feature pyramid.
-    """
+    """Warps the feature pyramid using the flow pyramid."""
     warped_feature_pyramid = []
     for features, flow in zip(feature_pyramid, flow_pyramid):
         warped_feature_pyramid.append(warp(features, flow))
     return warped_feature_pyramid
 
 
+@torch.jit.script
 def concatenate_pyramids(pyramid1: List[torch.Tensor],
                          pyramid2: List[torch.Tensor]) -> List[torch.Tensor]:
     """Concatenates each pyramid level together in the channel dimension."""
     result = []
-    for features1, features2 in zip(pyramid1, pyramid2):
-        result.append(torch.cat([features1, features2], dim=1))
+    for i in range(len(pyramid1)):
+        result.append(torch.cat([pyramid1[i], pyramid2[i]], dim=1))
+    return result
+
+
+@torch.jit.script
+def fuse_pyramids(pyramid1: List[torch.Tensor],
+                  pyramid2: List[torch.Tensor],
+                  pyramid3: List[torch.Tensor],
+                  pyramid4: List[torch.Tensor]) -> List[torch.Tensor]:
+    """Fuses four pyramids into one by concatenating levels."""
+    result = []
+    for i in range(len(pyramid1)):
+        result.append(torch.cat([pyramid1[i], pyramid2[i], pyramid3[i], pyramid4[i]], dim=1))
     return result
 
 

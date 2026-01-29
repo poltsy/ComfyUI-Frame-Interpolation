@@ -72,8 +72,12 @@ class MakeInterpolationStateList:
     CATEGORY = "ComfyUI-Frame-Interpolation/VFI"    
 
     def create_options(self, frame_indices: str, is_skip_list: bool):
-        frame_indices_list = [int(item) for item in frame_indices.split(',')]
-        
+        raw_split = frame_indices.split(',')
+        try:
+            frame_indices_list = [int(item) for item in raw_split]
+        except ValueError:
+            frame_indices_list = [int(item.strip()) for item in raw_split]
+
         interpolation_state_list = InterpolationStateList(
             frame_indices=frame_indices_list,
             is_skip_list=is_skip_list,
