@@ -129,7 +129,20 @@ class RIFE_VFI:
         cache_key = (ckpt_name, dtype, torch_compile)
         if cache_key not in _model_cache:
             interpolation_model = IFNet(arch_ver=arch_ver)
-            interpolation_model.load_state_dict(torch.load(model_path, weights_only=False))
+
+            # 加载状态字典
+            state_dict = torch.load(model_path, weights_only=False)
+
+            # rife426.pth 包含 teacher 和 caltime 前缀，需要过滤
+            if ckpt_name == "rife426.pth":
+                filtered_state_dict = {}
+                for k, v in state_dict.items():
+                    if not k.startswith('teacher.') and not k.startswith('caltime.'):
+                        filtered_state_dict[k] = v
+                interpolation_model.load_state_dict(filtered_state_dict, strict=False)
+            else:
+                interpolation_model.load_state_dict(state_dict)
+
             if torch_dtype != torch.float32:
                 interpolation_model = interpolation_model.to(torch_dtype)
             interpolation_model.eval().to(device)
