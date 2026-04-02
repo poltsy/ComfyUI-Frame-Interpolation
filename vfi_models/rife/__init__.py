@@ -39,7 +39,7 @@ class RIFE_VFI:
             "required": {
                 "ckpt_name": (
                     sorted(list(CKPT_NAME_VER_DICT.keys()), key=lambda ckpt_name: version.parse(CKPT_NAME_VER_DICT[ckpt_name])),
-                    {"default": "rife49.pth"}
+                    {"default": "rife426.pth"}
                 ),
                 "frames": ("IMAGE", ),
                 "clear_cache_after_n_frames": ("INT", {"default": 10, "min": 1, "max": 1000}),
