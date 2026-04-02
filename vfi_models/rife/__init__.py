@@ -193,8 +193,6 @@ class RIFE_VFI:
                 return (postprocess_frames(frames.to(torch.float32)),)
 
             n_output = max(2, round((n_input - 1) * target_fps / source_fps) + 1)
-            print(f"Comfy-VFI: FPS mode {source_fps} → {target_fps} fps  ({n_input} → {n_output} frames)")
-
             for out_i in range(n_output):
                 # Map output frame index to a continuous position in input-frame space
                 input_pos = out_i * (n_input - 1) / (n_output - 1)
@@ -209,6 +207,7 @@ class RIFE_VFI:
                 else:
                     output_specs.append(('interp', len(tasks)))
                     tasks.append((pair_idx, alpha))
+            print(f"Comfy-VFI: FPS mode {source_fps} → {target_fps} fps  ({n_input} → {n_output}, {len(tasks)} generated frames)")
 
         else:
             # Multiplier mode: insert (multiplier-1) evenly-spaced frames between each pair.
@@ -231,6 +230,8 @@ class RIFE_VFI:
                     output_specs.append(('interp', len(tasks)))
                     tasks.append((pair_idx, step / m))
             output_specs.append(('orig', n_input - 1))
+            n_output = len(frames) + len(tasks)
+            print(f"Comfy-VFI: Multiplier mode {multiplier}x {len(frames)} → {n_output}, {len(tasks)} generated frames")
 
         # Flat array to hold each interpolated frame result, indexed by task position.
         interp_results: typing.List[typing.Optional[torch.Tensor]] = [None] * len(tasks)
@@ -268,18 +269,25 @@ class RIFE_VFI:
                 for i, (pair_idx, _) in enumerate(batch_tasks):
                     task_idx = pos + i
                     interp_results[task_idx] = middle_frames[i : i + 1].to(dtype=torch_dtype)
+                    cur_frame = pos + 1
+                    print(f"Comfy-VFI: Generating frame {cur_frame} / {len(tasks)}  ", end=' ')
 
                     if not use_fps_mode:
                         tasks_remaining_per_pair[pair_idx] -= 1
+                        print(f"Frames in cache: {frames_processed_since_cache_clear} / {clear_cache_after_n_frames}  ", end='\r')
                         if tasks_remaining_per_pair[pair_idx] == 0:
                             frames_processed_since_cache_clear += 1
                             if frames_processed_since_cache_clear >= clear_cache_after_n_frames:
-                                print("Comfy-VFI: Clearing cache...", end=' ')
                                 soft_empty_cache()
                                 gc.collect()
                                 frames_processed_since_cache_clear = 0
-                                print("Done cache clearing")
-
+                    else:
+                        frames_processed_since_cache_clear += 1
+                        print(f"Frames in cache: {frames_processed_since_cache_clear} / {clear_cache_after_n_frames}  ", end='\r')
+                        if frames_processed_since_cache_clear >= clear_cache_after_n_frames:
+                            soft_empty_cache()
+                            gc.collect()
+                            frames_processed_since_cache_clear = 0
                 pos += len(batch_tasks)
 
         # Assemble output frames in order using output_specs
@@ -290,10 +298,8 @@ class RIFE_VFI:
             else:
                 output_frames.append(interp_results[spec[1]])
 
-        print("Comfy-VFI: Final clearing cache...", end=' ')
         soft_empty_cache()
-        print("Done cache clearing")
-        print(f"Comfy-VFI done! {len(output_frames)} frames generated")
+        print(f"\nComfy-VFI done! {len(output_frames)} frames out")
 
         # Always return float32 — numpy and all downstream ComfyUI nodes require it
         out_tensor = torch.cat(output_frames, dim=0).to(torch.float32)
