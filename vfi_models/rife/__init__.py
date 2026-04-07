@@ -5,6 +5,7 @@ from vfi_utils import load_file_from_github_release, preprocess_frames, postproc
 import typing
 from comfy.model_management import get_torch_device, soft_empty_cache
 from packaging import version
+from comfy.utils import ProgressBar
 
 MODEL_TYPE = pathlib.Path(__file__).parent.name
 CKPT_NAME_VER_DICT = {
@@ -208,6 +209,7 @@ class RIFE_VFI:
                     output_specs.append(('interp', len(tasks)))
                     tasks.append((pair_idx, alpha))
             print(f"Comfy-VFI: FPS mode {source_fps} → {target_fps} fps  ({n_input} → {n_output}, {len(tasks)} generated frames)")
+            comfy_pbar = ProgressBar(len(tasks))
 
         else:
             # Multiplier mode: insert (multiplier-1) evenly-spaced frames between each pair.
@@ -232,6 +234,7 @@ class RIFE_VFI:
             output_specs.append(('orig', n_input - 1))
             n_output = len(frames) + len(tasks)
             print(f"Comfy-VFI: Multiplier mode {multiplier}x {len(frames)} → {n_output}, {len(tasks)} generated frames")
+            comfy_pbar = ProgressBar(len(tasks))
 
         # Flat array to hold each interpolated frame result, indexed by task position.
         interp_results: typing.List[typing.Optional[torch.Tensor]] = [None] * len(tasks)
@@ -271,6 +274,7 @@ class RIFE_VFI:
                     interp_results[task_idx] = middle_frames[i : i + 1].to(dtype=torch_dtype)
                     cur_frame = pos + 1
                     print(f"Comfy-VFI: Generating frame {cur_frame} / {len(tasks)}  ", end=' ')
+                    comfy_pbar.update_absolute(cur_frame, len(tasks))
 
                     if not use_fps_mode:
                         tasks_remaining_per_pair[pair_idx] -= 1
