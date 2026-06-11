@@ -165,10 +165,10 @@ class RIFE_VFI:
             if torch_compile:
                 interpolation_model = torch.compile(interpolation_model)
             _model_cache[cache_key] = interpolation_model
-            print(f"Comfy-VFI: Loaded and cached model {ckpt_name} ({dtype}{'+ torch.compile' if torch_compile else ''})")
+            print(f"[RIFE VFI] Loaded and cached model {ckpt_name} ({dtype}{'+ torch.compile' if torch_compile else ''})")
         else:
             interpolation_model = _model_cache[cache_key]
-            print(f"Comfy-VFI: Using cached model {ckpt_name} ({dtype}{'+ torch.compile' if torch_compile else ''})")
+            print(f"[RIFE VFI] Using cached model {ckpt_name} ({dtype}{'+ torch.compile' if torch_compile else ''})")
 
         frames = preprocess_frames(frames)
 
@@ -190,7 +190,7 @@ class RIFE_VFI:
         if use_fps_mode:
             # FPS mode: place output frames at exact target_fps timestamps.
             if abs(source_fps - target_fps) < 0.01:
-                print("Comfy-VFI: source_fps ≈ target_fps, returning frames unchanged.")
+                print("[RIFE VFI] source_fps ≈ target_fps, returning frames unchanged.")
                 return (postprocess_frames(frames.to(torch.float32)),)
 
             n_output = max(2, round((n_input - 1) * target_fps / source_fps) + 1)
@@ -208,7 +208,7 @@ class RIFE_VFI:
                 else:
                     output_specs.append(('interp', len(tasks)))
                     tasks.append((pair_idx, alpha))
-            print(f"Comfy-VFI: FPS mode {source_fps} → {target_fps} fps  ({n_input} → {n_output}, {len(tasks)} generated frames)")
+            print(f"[RIFE VFI] FPS mode {source_fps} → {target_fps} fps  ({n_input} → {n_output}, {len(tasks)} generated frames)")
             comfy_pbar = ProgressBar(len(tasks))
 
         else:
@@ -233,7 +233,7 @@ class RIFE_VFI:
                     tasks.append((pair_idx, step / m))
             output_specs.append(('orig', n_input - 1))
             n_output = len(frames) + len(tasks)
-            print(f"Comfy-VFI: Multiplier mode {multiplier}x {len(frames)} → {n_output}, {len(tasks)} generated frames")
+            print(f"[RIFE VFI] Multiplier mode {multiplier}x {len(frames)} → {n_output}, {len(tasks)} generated frames")
             comfy_pbar = ProgressBar(len(tasks))
 
         # Flat array to hold each interpolated frame result, indexed by task position.
@@ -273,7 +273,7 @@ class RIFE_VFI:
                     task_idx = pos + i
                     interp_results[task_idx] = middle_frames[i : i + 1].to(dtype=torch_dtype)
                     cur_frame = pos + 1
-                    print(f"Comfy-VFI: Generating frame {cur_frame} / {len(tasks)}  ", end=' ')
+                    print(f"[RIFE VFI] Generating frame {cur_frame} / {len(tasks)}  ", end=' ')
                     comfy_pbar.update_absolute(cur_frame, len(tasks))
 
                     if not use_fps_mode:
@@ -303,7 +303,7 @@ class RIFE_VFI:
                 output_frames.append(interp_results[spec[1]])
 
         soft_empty_cache()
-        print(f"\nComfy-VFI done! {len(output_frames)} frames out")
+        print(f"\n[RIFE VFI] done! {len(output_frames)} frames out")
 
         # Always return float32 — numpy and all downstream ComfyUI nodes require it
         out_tensor = torch.cat(output_frames, dim=0).to(torch.float32)
