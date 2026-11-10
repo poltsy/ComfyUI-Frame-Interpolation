@@ -234,8 +234,9 @@ class RIFE_VFI:
 
         with torch.inference_mode():
             while pos < len(tasks):
-                frame0_batch = frames[pos : pos + 1].to(device, dtype=torch_dtype)
-                frame1_batch = frames[pos + 1 : pos + 2].to(device, dtype=torch_dtype)
+                pair_idx, alpha = tasks[pos]
+                frame0_batch = frames[pair_idx : pair_idx + 1].to(device, dtype=torch_dtype)
+                frame1_batch = frames[pair_idx + 1 : pair_idx + 2].to(device, dtype=torch_dtype)
                 timestep_tensor = torch.tensor([tasks[pos][1]],
                     dtype=torch_dtype, device=device).view(1, 1, 1, 1)
 
@@ -249,7 +250,6 @@ class RIFE_VFI:
                 ).clamp(0, 1).detach().cpu()
 
                 task_idx = pos
-                pair_idx, _ = tasks[pos]
                 interp_results[task_idx] = middle_frames.to(dtype=torch_dtype)
                 cur_frame = pos + 1
                 print(f"[RIFE VFI] Generating frame {cur_frame} / {len(tasks)}  ", end=' ')
