@@ -1,5 +1,6 @@
 import torch
 import pathlib
+from fractions import Fraction
 from vfi_utils import load_file_from_github_release, preprocess_frames, postprocess_frames, InterpolationStateList
 import typing
 from comfy.model_management import get_torch_device, soft_empty_cache
@@ -30,6 +31,13 @@ DTYPE_MAP = {
 # Key: (ckpt_name, dtype, torch_compile) — invalidated if any of these change.
 _model_cache: typing.Dict[typing.Tuple, torch.nn.Module] = {}
 
+def _valid_dtype(precision: str, device):
+    if device.type != "cuda":
+        print(f"[RIFE VFI] non-CUDA device ({device}); forcing fp32.")
+        return torch.float32
+    if precision == "bfloat16":
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
+    return DTYPE_MAP.get(precision, torch.float32)
 
 class RIFE_VFI:
 
@@ -118,8 +126,8 @@ class RIFE_VFI:
 
         model_path = load_file_from_github_release(MODEL_TYPE, ckpt_name)
         arch_ver = CKPT_NAME_VER_DICT[ckpt_name]
-        torch_dtype = DTYPE_MAP[dtype]
         device = get_torch_device()
+        torch_dtype = _valid_dtype(dtype, device)
 
         #  4.26 disable ensemble
         if arch_ver == "4.26":
@@ -158,85 +166,140 @@ class RIFE_VFI:
             interpolation_model = _model_cache[cache_key]
             print(f"[RIFE VFI] Using cached model {ckpt_name} ({dtype}{'+ torch.compile' if torch_compile else ''})", end =' ')
 
-        frames = preprocess_frames(frames)
+        frames_nchw = preprocess_frames(frames)  # NCHW float32 on CPU
 
         if arch_ver == "4.26":
             scale_list = [16 / scale_factor, 8 / scale_factor, 4 / scale_factor, 2 / scale_factor, 1 / scale_factor]
         else:
             scale_list = [8 / scale_factor, 4 / scale_factor, 2 / scale_factor, 1 / scale_factor]
 
-        # output_specs: describes every output frame in order.
-        #   ('orig', frame_idx)      — copy frames[frame_idx] directly
-        #   ('interp', task_idx)     — result of tasks[task_idx]
-        output_specs: typing.List[typing.Tuple] = []
-        tasks: typing.List[typing.Tuple[int, float]] = []
-        use_fps_mode = fps_mode and source_fps > 0 and target_fps > 0
-        n_input = len(frames)
+        n_input = len(frames_nchw)
         n_pairs = n_input - 1
+        use_fps_mode = fps_mode and source_fps > 0 and target_fps > 0
+
+        # Compute total_output first, then allocate a single NHWC fp32 tensor.
+        h, w = frames_nchw.shape[2], frames_nchw.shape[3]
+        c = frames_nchw.shape[1]
+        output_frames: torch.Tensor  # allocated below
+        tasks: typing.List[typing.Tuple[int, float]] = []
+        output_specs: typing.List[typing.Tuple] = []
 
         if use_fps_mode:
-            # FPS mode: place output frames at exact target_fps timestamps.
-            if abs(source_fps - target_fps) < 0.01:
+            # Convert source/target fps to Fractions
+            src_frac = Fraction(str(source_fps)).limit_denominator(1000)
+            tgt_frac = Fraction(str(target_fps)).limit_denominator(1000)
+            if abs(float(src_frac - tgt_frac)) < 0.01:
                 print("source_fps ≈ target_fps, returning frames unchanged.")
-                return (postprocess_frames(frames.to(torch.float32)),)
+                return (postprocess_frames(frames_nchw.to(torch.float32)),)
 
-            n_output = max(2, round((n_input - 1) * target_fps / source_fps) + 1)
+            # Estimate output count for the iteration range.
+            n_output = max(2, int((n_input - 1) * tgt_frac / src_frac) + 1)
+
+            # Build a schedule: for each output tick compute the source pair
+            # index and interpolation alpha using exact Fraction arithmetic.
             for out_i in range(n_output):
-                # Map output frame index to a continuous position in input-frame space
-                input_pos = out_i * (n_input - 1) / (n_output - 1)
-                pair_idx = int(input_pos)
-                alpha = input_pos - pair_idx
+                # Exact continuous position in input-frame space (Fraction).
+                num = Fraction(out_i) * (n_input - 1) / (n_output - 1)
+                pair_idx = int(num)
+                alpha = float(num - pair_idx)
 
-                if pair_idx >= n_pairs or alpha < 1e-6:
-                    # Exact input frame (or past the last)
-                    output_specs.append(('orig', min(pair_idx, n_input - 1)))
+                if pair_idx >= n_pairs or alpha < 1e-6 or alpha > 1 - 1e-6:
+                    output_specs.append(('orig', min(pair_idx + int(alpha > 0.5), n_input - 1)))
                 elif optional_interpolation_states is not None and optional_interpolation_states.is_frame_skipped(pair_idx):
                     output_specs.append(('orig', pair_idx))
                 else:
                     output_specs.append(('interp', len(tasks)))
                     tasks.append((pair_idx, alpha))
             print(f"FPS mode {source_fps} → {target_fps} fps  ({n_input} → {n_output}, {len(tasks)} generated frames)")
-            comfy_pbar = ProgressBar(len(tasks))
 
-        else:
-            # Multiplier mode: insert (multiplier-1) evenly-spaced frames between each pair.
+        else: # Multiplier mode
             if isinstance(multiplier, int):
                 multipliers = [int(multiplier)] * n_pairs
             else:
                 multipliers = list(map(int, multiplier))
                 multipliers += [2] * (n_pairs - len(multipliers))
 
+            # Precompute total output count.
             tasks_remaining_per_pair: typing.Dict[int, int] = {}
+            n_output = 0
             for pair_idx in range(n_pairs):
-                output_specs.append(('orig', pair_idx))
+                n_output += 1  # original frame at this position
                 if optional_interpolation_states is not None and optional_interpolation_states.is_frame_skipped(pair_idx):
                     tasks_remaining_per_pair[pair_idx] = 0
                     continue
                 m = multipliers[pair_idx]
                 n_steps = max(m - 1, 0)
                 tasks_remaining_per_pair[pair_idx] = n_steps
+                n_output += n_steps
+            n_output += 1  # trailing original frame
+
+            for pair_idx in range(n_pairs):
+                output_specs.append(('orig', pair_idx))
+                if optional_interpolation_states is not None and optional_interpolation_states.is_frame_skipped(pair_idx):
+                    continue
+                m = multipliers[pair_idx]
                 for step in range(1, m):
                     output_specs.append(('interp', len(tasks)))
                     tasks.append((pair_idx, step / m))
             output_specs.append(('orig', n_input - 1))
-            n_output = len(frames) + len(tasks)
-            print(f"Multiplier mode {multiplier}x {len(frames)} → {n_output}, {len(tasks)} generated frames")
-            comfy_pbar = ProgressBar(len(tasks))
+            print(f"Multiplier mode {multiplier}x fps ({len(frames_nchw)} → {n_output}, {len(tasks)} generated frames)")
 
-        # Flat array to hold each interpolated frame result, indexed by task position.
-        interp_results: typing.List[typing.Optional[torch.Tensor]] = [None] * len(tasks)
+        # output_specs interleaves ('orig', src_idx) and ('interp', task_pos)
+        # entries. Walk it once: for every 'interp' entry record which slot
+        # that task position writes into.
+        task_slot_map = [0] * len(tasks)  # task_pos → output slot index
+        out_slot = 0
+        for spec in output_specs:
+            if spec[0] == 'orig':
+                out_slot += 1
+            else:
+                task_slot_map[spec[1]] = out_slot
+                out_slot += 1
 
+        n_output_actual = len(output_specs)
+        output_frames = torch.empty(n_output_actual, h, w, c, dtype=torch.float32)
+
+        # Fill original frames into their exact slots up front.
+        if use_fps_mode:
+            out_slot = 0
+            for spec in output_specs:
+                if spec[0] == 'orig':
+                    src_idx = spec[1]
+                    output_frames[out_slot] = frames_nchw[src_idx].permute(1, 2, 0)
+                out_slot += 1
+        else:
+            fill_pos = 0
+            for pair_idx in range(n_pairs):
+                output_frames[fill_pos] = frames_nchw[pair_idx].permute(1, 2, 0)
+                n_interp = tasks_remaining_per_pair.get(pair_idx, 0)
+                fill_pos += 1 + n_interp
+            output_frames[fill_pos] = frames_nchw[-1].permute(1, 2, 0)
+
+        staging = None
+        if device.type == "cuda":
+            staging = torch.empty(c, h, w, dtype=torch_dtype, pin_memory=True)
+
+        comfy_pbar = ProgressBar(len(tasks))
         frames_processed_since_cache_clear = 0
         pos = 0
+
+        # reuse frame1 of pair N as frame0 of pair N+1
+        gpu_frame1 = None       # last uploaded frame1 tensor on GPU
+        gpu_pair_idx = -1       # which pair its frame1 belongs to
 
         with torch.inference_mode():
             while pos < len(tasks):
                 pair_idx, alpha = tasks[pos]
-                frame0_batch = frames[pair_idx : pair_idx + 1].to(device, dtype=torch_dtype)
-                frame1_batch = frames[pair_idx + 1 : pair_idx + 2].to(device, dtype=torch_dtype)
-                timestep_tensor = torch.tensor([tasks[pos][1]],
-                    dtype=torch_dtype, device=device).view(1, 1, 1, 1)
 
+                # reuse the already-uploaded frame0.
+                if gpu_frame1 is not None and pair_idx == gpu_pair_idx + 1:
+                    frame0_batch = gpu_frame1
+                else:
+                    frame0_batch = frames_nchw[pair_idx : pair_idx + 1].to(device, dtype=torch_dtype)
+
+                frame1_batch = frames_nchw[pair_idx + 1 : pair_idx + 2].to(device, dtype=torch_dtype)
+                timestep_tensor = torch.tensor([alpha],
+                    dtype=torch_dtype, device=device).view(1, 1, 1, 1)
                 middle_frames = interpolation_model(
                     frame0_batch,
                     frame1_batch,
@@ -244,44 +307,42 @@ class RIFE_VFI:
                     scale_list,
                     fast_mode,
                     ensemble,
-                ).clamp(0, 1).detach().cpu()
+                ).clamp(0, 1).detach()
+                write_slot = task_slot_map[pos]
 
-                task_idx = pos
-                interp_results[task_idx] = middle_frames.to(dtype=torch_dtype)
+                if staging is not None:
+                    staging.copy_(middle_frames[0], non_blocking=True)
+                    torch.cuda.current_stream(device).synchronize()
+                    output_frames[write_slot].copy_(staging.permute(1, 2, 0))
+                else:
+                    output_frames[write_slot].copy_(
+                        middle_frames[0]
+                        .permute(1, 2, 0)
+                        .to(dtype=torch.float32, device="cpu")
+                    )
+
                 cur_frame = pos + 1
-                print(f"[RIFE VFI] Generating frame {cur_frame} / {len(tasks)}  ", end=' ')
+                print(f"[RIFE VFI] Generating frame {cur_frame} / {len(tasks)}  ", end='\r')
                 comfy_pbar.update_absolute(cur_frame, len(tasks))
+                frames_processed_since_cache_clear += 1
 
                 if not use_fps_mode:
                     tasks_remaining_per_pair[pair_idx] -= 1
-                    print(f"Frames in cache: {frames_processed_since_cache_clear} / {clear_cache_after_n_frames}  ", end='\r')
                     if tasks_remaining_per_pair[pair_idx] == 0:
                         frames_processed_since_cache_clear += 1
-                        if frames_processed_since_cache_clear >= clear_cache_after_n_frames:
-                            soft_empty_cache()
-                            frames_processed_since_cache_clear = 0
-                else:
-                    frames_processed_since_cache_clear += 1
-                    print(f"Frames in cache: {frames_processed_since_cache_clear} / {clear_cache_after_n_frames}  ", end='\r')
-                    if frames_processed_since_cache_clear >= clear_cache_after_n_frames:
-                        soft_empty_cache()
-                        frames_processed_since_cache_clear = 0
-                pos += 1
 
-        # Assemble output frames in order using output_specs
-        output_frames: typing.List[torch.Tensor] = []
-        for spec in output_specs:
-            if spec[0] == 'orig':
-                output_frames.append(frames[spec[1] : spec[1] + 1].to(dtype=torch_dtype))
-            else:
-                output_frames.append(interp_results[spec[1]])
+                if frames_processed_since_cache_clear >= clear_cache_after_n_frames:
+                    soft_empty_cache()
+                    frames_processed_since_cache_clear = 0
+
+                # Update frame reuse state.
+                gpu_frame1 = frame1_batch.detach().clone()
+                gpu_pair_idx = pair_idx
+                pos += 1
 
         del interpolation_model
         soft_empty_cache()
-        print(f"done! {len(output_frames)} frames out")
-
-        # Always return float32 — numpy and all downstream ComfyUI nodes require it
-        ready_frames = postprocess_frames(torch.cat(output_frames, dim=0)).to(torch.float32)
+        ready_frames = output_frames[:n_output_actual].to(torch.float32)
         del output_frames
         soft_empty_cache()
-        return (ready_frames,)
+        return (postprocess_frames(ready_frames.permute(0, 3, 1, 2)),)
