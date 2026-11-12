@@ -1,4 +1,3 @@
-import gc
 import torch
 import pathlib
 from vfi_utils import load_file_from_github_release, preprocess_frames, postprocess_frames, InterpolationStateList
@@ -43,7 +42,7 @@ class RIFE_VFI:
                     {"default": "rife426.pth"}
                 ),
                 "frames": ("IMAGE", ),
-                "clear_cache_after_n_frames": ("INT", {"default": 10, "min": 1, "max": 1000}),
+                "clear_cache_after_n_frames": ("INT", {"default": 1000, "min": 1, "max": 10000}),
                 "fps_mode": ("BOOLEAN", {"default": False,
                                          "tooltip": "When enabled, use source_fps and target_fps to determine output frame count "
                                                     "instead of multiplier."}),
@@ -52,23 +51,11 @@ class RIFE_VFI:
                 "fast_mode": ("BOOLEAN", {"default": True}),
                 "ensemble": ("BOOLEAN", {"default": True}),
                 "scale_factor": ([0.25, 0.5, 1.0, 2.0, 4.0], {"default": 1.0}),
-                # Opt 1: Precision — float32 is safe, float16 is ~2x faster/half VRAM,
-                #         bfloat16 is safer than float16 on Ampere+ GPUs (RTX 30xx+)
-                "dtype": (DTYPE_OPTIONS, {"default": "float32"}),
-                # Opt 2: torch.compile() — JIT-compiles the model graph for 10-30% speedup.
-                #         First inference will be slow (compilation), subsequent ones faster.
-                #         Requires PyTorch 2.0+. Disable if you hit errors on older builds.
+                "dtype": (DTYPE_OPTIONS, {"default": "bfloat16"}),
                 "torch_compile": ("BOOLEAN", {"default": False,
                                               "tooltip": "Compile the model with torch.compile() for 10-30% faster inference "
                                                          "after the first (warm-up) run. Requires PyTorch 2.0+."}),
-                # Opt 7: Batch tasks — process multiple (pair, timestep) tasks per GPU call.
-                #         Each task is one interpolated frame. Batching amortises kernel launch
-                #         overhead; higher values improve throughput but use more VRAM.
-                #         1 = one interpolated frame per call (safest).
-                "batch_size": ("INT", {"default": 1, "min": 1, "max": 64,
-                                       "tooltip": "Number of interpolation tasks per GPU call. "
-                                                  "Higher values improve throughput but use more VRAM. "
-                                                  "Set to 1 for the most conservative behaviour."}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 1, "tooltip": "Does nothing. "}),
             },
             "optional": {
                 "optional_interpolation_states": ("INTERPOLATION_STATES", ),
@@ -89,13 +76,13 @@ class RIFE_VFI:
         self,
         ckpt_name: typing.AnyStr,
         frames: torch.Tensor,
-        clear_cache_after_n_frames: int = 10,
+        clear_cache_after_n_frames: int = 1000,
         fps_mode: bool = False,
         multiplier: typing.SupportsInt = 2,
-        fast_mode: bool = False,
-        ensemble: bool = False,
+        fast_mode: bool = True,
+        ensemble: bool = True,
         scale_factor: float = 1.0,
-        dtype: str = "float32",
+        dtype: str = "bfloat16",
         torch_compile: bool = False,
         batch_size: int = 1,
         optional_interpolation_states: InterpolationStateList = None,
@@ -136,7 +123,7 @@ class RIFE_VFI:
 
         #  4.26 disable ensemble
         if arch_ver == "4.26":
-            ensemble = False  # 4.26 版本不支持 ensemble
+            ensemble = False
 
         # Cache the model by (ckpt_name, dtype, torch_compile) so repeated node
         # executions skip the load_state_dict + device transfer entirely.
@@ -147,7 +134,7 @@ class RIFE_VFI:
             # 加载状态字典
             state_dict = torch.load(model_path, weights_only=False)
 
-            # rife426.pth 包含 teacher 和 caltime 前缀，需要过滤
+            # rife426.pth contains teacher and caltime prefixes that need filtering
             if ckpt_name == "rife426.pth":
                 filtered_state_dict = {}
                 for k, v in state_dict.items():
@@ -160,19 +147,19 @@ class RIFE_VFI:
             if torch_dtype != torch.float32:
                 interpolation_model = interpolation_model.to(torch_dtype)
             interpolation_model.eval().to(device)
-            # Opt 2: torch.compile() — JIT-compiles the model for 10-30% faster inference.
-            # The first call triggers compilation (slow); all subsequent calls use the cached graph.
+            del state_dict
+            soft_empty_cache()
+
             if torch_compile:
                 interpolation_model = torch.compile(interpolation_model)
             _model_cache[cache_key] = interpolation_model
-            print(f"[RIFE VFI] Loaded and cached model {ckpt_name} ({dtype}{'+ torch.compile' if torch_compile else ''})")
+            print(f"[RIFE VFI] Loaded and cached model {ckpt_name} ({dtype}{'+ torch.compile' if torch_compile else ''})", end=' ')
         else:
             interpolation_model = _model_cache[cache_key]
-            print(f"[RIFE VFI] Using cached model {ckpt_name} ({dtype}{'+ torch.compile' if torch_compile else ''})")
+            print(f"[RIFE VFI] Using cached model {ckpt_name} ({dtype}{'+ torch.compile' if torch_compile else ''})", end =' ')
 
         frames = preprocess_frames(frames)
 
-         #  4.26 scale_list
         if arch_ver == "4.26":
             scale_list = [16 / scale_factor, 8 / scale_factor, 4 / scale_factor, 2 / scale_factor, 1 / scale_factor]
         else:
@@ -190,7 +177,7 @@ class RIFE_VFI:
         if use_fps_mode:
             # FPS mode: place output frames at exact target_fps timestamps.
             if abs(source_fps - target_fps) < 0.01:
-                print("[RIFE VFI] source_fps ≈ target_fps, returning frames unchanged.")
+                print("source_fps ≈ target_fps, returning frames unchanged.")
                 return (postprocess_frames(frames.to(torch.float32)),)
 
             n_output = max(2, round((n_input - 1) * target_fps / source_fps) + 1)
@@ -208,7 +195,7 @@ class RIFE_VFI:
                 else:
                     output_specs.append(('interp', len(tasks)))
                     tasks.append((pair_idx, alpha))
-            print(f"[RIFE VFI] FPS mode {source_fps} → {target_fps} fps  ({n_input} → {n_output}, {len(tasks)} generated frames)")
+            print(f"FPS mode {source_fps} → {target_fps} fps  ({n_input} → {n_output}, {len(tasks)} generated frames)")
             comfy_pbar = ProgressBar(len(tasks))
 
         else:
@@ -233,7 +220,7 @@ class RIFE_VFI:
                     tasks.append((pair_idx, step / m))
             output_specs.append(('orig', n_input - 1))
             n_output = len(frames) + len(tasks)
-            print(f"[RIFE VFI] Multiplier mode {multiplier}x {len(frames)} → {n_output}, {len(tasks)} generated frames")
+            print(f"Multiplier mode {multiplier}x {len(frames)} → {n_output}, {len(tasks)} generated frames")
             comfy_pbar = ProgressBar(len(tasks))
 
         # Flat array to hold each interpolated frame result, indexed by task position.
@@ -242,23 +229,13 @@ class RIFE_VFI:
         frames_processed_since_cache_clear = 0
         pos = 0
 
-        # Opt 5: inference_mode disables autograd tracking entirely — lower overhead than no_grad().
-        # Opt 7: process batch_size tasks per GPU call. IFNet supports batched tensor timesteps,
-        #         so multiple (pair, timestep) combinations can be inferred in a single forward pass.
         with torch.inference_mode():
             while pos < len(tasks):
-                batch_tasks = tasks[pos : pos + batch_size]
-
-                frame0_list, frame1_list, timestep_list = [], [], []
-                for pair_idx, dt in batch_tasks:
-                    frame0_list.append(frames[pair_idx : pair_idx + 1])
-                    frame1_list.append(frames[pair_idx + 1 : pair_idx + 2])
-                    timestep_list.append(dt)
-
-                frame0_batch = torch.cat(frame0_list, dim=0).to(device, dtype=torch_dtype)
-                frame1_batch = torch.cat(frame1_list, dim=0).to(device, dtype=torch_dtype)
-                # Batched timestep tensor: shape [B, 1, 1, 1] — IFNet expands it internally
-                timestep_tensor = torch.tensor(timestep_list, dtype=torch_dtype, device=device).view(-1, 1, 1, 1)
+                pair_idx, alpha = tasks[pos]
+                frame0_batch = frames[pair_idx : pair_idx + 1].to(device, dtype=torch_dtype)
+                frame1_batch = frames[pair_idx + 1 : pair_idx + 2].to(device, dtype=torch_dtype)
+                timestep_tensor = torch.tensor([tasks[pos][1]],
+                    dtype=torch_dtype, device=device).view(1, 1, 1, 1)
 
                 middle_frames = interpolation_model(
                     frame0_batch,
@@ -269,30 +246,27 @@ class RIFE_VFI:
                     ensemble,
                 ).clamp(0, 1).detach().cpu()
 
-                for i, (pair_idx, _) in enumerate(batch_tasks):
-                    task_idx = pos + i
-                    interp_results[task_idx] = middle_frames[i : i + 1].to(dtype=torch_dtype)
-                    cur_frame = pos + 1
-                    print(f"[RIFE VFI] Generating frame {cur_frame} / {len(tasks)}  ", end=' ')
-                    comfy_pbar.update_absolute(cur_frame, len(tasks))
+                task_idx = pos
+                interp_results[task_idx] = middle_frames.to(dtype=torch_dtype)
+                cur_frame = pos + 1
+                print(f"[RIFE VFI] Generating frame {cur_frame} / {len(tasks)}  ", end=' ')
+                comfy_pbar.update_absolute(cur_frame, len(tasks))
 
-                    if not use_fps_mode:
-                        tasks_remaining_per_pair[pair_idx] -= 1
-                        print(f"Frames in cache: {frames_processed_since_cache_clear} / {clear_cache_after_n_frames}  ", end='\r')
-                        if tasks_remaining_per_pair[pair_idx] == 0:
-                            frames_processed_since_cache_clear += 1
-                            if frames_processed_since_cache_clear >= clear_cache_after_n_frames:
-                                soft_empty_cache()
-                                gc.collect()
-                                frames_processed_since_cache_clear = 0
-                    else:
+                if not use_fps_mode:
+                    tasks_remaining_per_pair[pair_idx] -= 1
+                    print(f"Frames in cache: {frames_processed_since_cache_clear} / {clear_cache_after_n_frames}  ", end='\r')
+                    if tasks_remaining_per_pair[pair_idx] == 0:
                         frames_processed_since_cache_clear += 1
-                        print(f"Frames in cache: {frames_processed_since_cache_clear} / {clear_cache_after_n_frames}  ", end='\r')
                         if frames_processed_since_cache_clear >= clear_cache_after_n_frames:
                             soft_empty_cache()
-                            gc.collect()
                             frames_processed_since_cache_clear = 0
-                pos += len(batch_tasks)
+                else:
+                    frames_processed_since_cache_clear += 1
+                    print(f"Frames in cache: {frames_processed_since_cache_clear} / {clear_cache_after_n_frames}  ", end='\r')
+                    if frames_processed_since_cache_clear >= clear_cache_after_n_frames:
+                        soft_empty_cache()
+                        frames_processed_since_cache_clear = 0
+                pos += 1
 
         # Assemble output frames in order using output_specs
         output_frames: typing.List[torch.Tensor] = []
@@ -302,9 +276,12 @@ class RIFE_VFI:
             else:
                 output_frames.append(interp_results[spec[1]])
 
+        del interpolation_model
         soft_empty_cache()
-        print(f"\n[RIFE VFI] done! {len(output_frames)} frames out")
+        print(f"done! {len(output_frames)} frames out")
 
         # Always return float32 — numpy and all downstream ComfyUI nodes require it
-        out_tensor = torch.cat(output_frames, dim=0).to(torch.float32)
-        return (postprocess_frames(out_tensor),)
+        ready_frames = postprocess_frames(torch.cat(output_frames, dim=0)).to(torch.float32)
+        del output_frames
+        soft_empty_cache()
+        return (ready_frames,)
