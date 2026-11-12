@@ -9,15 +9,14 @@ from comfy.utils import ProgressBar
 
 MODEL_TYPE = pathlib.Path(__file__).parent.name
 CKPT_NAME_VER_DICT = {
+    "rife46.pth": "4.6",
     "rife47.pth": "4.7",
+    "rife48.pth": "4.7",
     "rife49.pth": "4.7",
     "rife417.pth": "4.17",
+    "rife425.pth": "4.26",
     "rife426.pth": "4.26",
-    "sudo_rife4_269.662_testV1_scale1.pth": "4.0",
-    # Arch 4.10 doesn't work due to state dict mismatch
-    # "rife410.pth": "4.10",
-    # "rife411.pth": "4.10",
-    # "rife412.pth": "4.10"
+    "sudo_rife4_269.662_testV1_scale1.pth": "4.0"
 }
 
 DTYPE_OPTIONS = ["float32", "float16", "bfloat16"]
@@ -63,7 +62,7 @@ class RIFE_VFI:
                 "torch_compile": ("BOOLEAN", {"default": False,
                                               "tooltip": "Compile the model with torch.compile() for 10-30% faster inference "
                                                          "after the first (warm-up) run. Requires PyTorch 2.0+."}),
-                "batch_size": ("INT", {"default": 1, "min": 1, "max": 1, "tooltip": "Does nothing. "}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 64, "tooltip": "Does nothing. "}),
             },
             "optional": {
                 "optional_interpolation_states": ("INTERPOLATION_STATES", ),
@@ -139,18 +138,24 @@ class RIFE_VFI:
         if cache_key not in _model_cache:
             interpolation_model = IFNet(arch_ver=arch_ver)
 
-            # 加载状态字典
-            state_dict = torch.load(model_path, weights_only=False)
+            try:
+                state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
+            except Exception:  # pickled checkpoint or older PyTorch
+                state_dict = torch.load(model_path, map_location="cpu")
 
-            # rife426.pth contains teacher and caltime prefixes that need filtering
-            if ckpt_name == "rife426.pth":
-                filtered_state_dict = {}
-                for k, v in state_dict.items():
-                    if not k.startswith('teacher.') and not k.startswith('caltime.'):
-                        filtered_state_dict[k] = v
-                interpolation_model.load_state_dict(filtered_state_dict, strict=False)
-            else:
-                interpolation_model.load_state_dict(state_dict)
+            if not isinstance(state_dict, dict):
+                raise RuntimeError(f"Unexpected checkpoint format for {ckpt_name}")
+
+            # Strip "module." prefix from DataParallel-saved checkpoints.
+            # Drop keys that don't exist on IFNet
+            model_keys = set(interpolation_model.state_dict().keys())
+            cleaned = {
+                k[len("module."):] if k.startswith("module.") else k: v
+                for k, v in state_dict.items()
+            }
+            interpolation_model.load_state_dict(
+                {k: v for k, v in cleaned.items() if k in model_keys}
+            )
 
             if torch_dtype != torch.float32:
                 interpolation_model = interpolation_model.to(torch_dtype)

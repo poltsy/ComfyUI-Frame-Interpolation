@@ -14,24 +14,34 @@ import numpy as np
 BASE_MODEL_DOWNLOAD_URLS = [
     "https://github.com/styler00dollar/VSGAN-tensorrt-docker/releases/download/models/",
     "https://github.com/Fannovel16/ComfyUI-Frame-Interpolation/releases/download/models/",
-    "https://github.com/dajes/frame-interpolation-pytorch/releases/download/v1.0.0/"
+    "https://github.com/dajes/frame-interpolation-pytorch/releases/download/v1.0.0/",
+    "https://github.com/AniScripts/AniSmooth-Models/releases/download/interpolation/"
 ]
 
-# Per-file fallback URLs for models no longer hosted at the base URLs above.
-# Each entry is a list of mirrors tried in order.
-CKPT_FALLBACK_URLS = {
+# Mirrors for checkpoints missing (404) from all GitHub release endpoints,
+CKPT_URL_OVERRIDES = {
+    "rife46.pth": [
+        "https://huggingface.co/muwmix/AIScripter-Assets/resolve/main/rife46.pth",
+        "https://huggingface.co/marduk191/rife/resolve/main/rife46.pth",
+    ],
     "rife47.pth": [
         "https://huggingface.co/marduk191/rife/resolve/main/rife47.pth",
-        "https://huggingface.co/wavespeed/misc/resolve/main/rife/rife47.pth",
-        "https://huggingface.co/MachineDelusions/RIFE/resolve/main/rife47.pth",
-        "https://huggingface.co/jasonot/mycomfyui/resolve/main/rife47.pth",
+    ],
+    "rife48.pth": [
+        "https://huggingface.co/Osrivers/VFI/resolve/main/rife48.pth",
+        "https://huggingface.co/marduk191/rife/resolve/main/rife48.pth",
     ],
     "rife49.pth": [
         "https://huggingface.co/marduk191/rife/resolve/main/rife49.pth",
         "https://huggingface.co/hfmaster/models-moved/resolve/main/rife/rife49.pth",
-        "https://huggingface.co/MachineDelusions/RIFE/resolve/main/rife49.pth",
-        "https://huggingface.co/Isi99999/Frame_Interpolation_Models/resolve/main/rife49.pth",
     ],
+    # Practical-RIFE v4.25 official weights shipped as "flownet.pkl";
+    # rename on download so the local file matches ckpt_name.
+    "rife425.pth": {
+        "url": "https://huggingface.co/Upsampler/rife-4-25/resolve/main/flownet.pkl",
+        "file_name": "rife425.pth",
+    },
+    # Community fine-tuned variant (built on the 4.0 architecture).
     "sudo_rife4_269.662_testV1_scale1.pth": [
         "https://huggingface.co/marduk191/rife/resolve/main/sudo_rife4_269.662_testV1_scale1.pth",
         "https://huggingface.co/uwg/upscaler/resolve/main/ESRGAN/sudo_rife4_269.662_testV1_scale1.pth",
@@ -120,21 +130,42 @@ def load_file_from_url(url, model_dir=None, progress=True, file_name=None):
     return cached_file
 
 def load_file_from_github_release(model_type, ckpt_name):
-    error_strs = []
-    all_urls = [base + ckpt_name for base in BASE_MODEL_DOWNLOAD_URLS]
-    all_urls += CKPT_FALLBACK_URLS.get(ckpt_name, [])
+    """Download a checkpoint by trying GitHub release mirrors then per-file overrides.
 
-    for i, url in enumerate(all_urls):
+    Returns the local path to the downloaded (or cached) file.  Raises on total failure.
+    """
+    error_strs = []
+    urls = []  # (url, file_name) pairs — file_name may be None meaning use URL basename
+
+    if ckpt_name in CKPT_URL_OVERRIDES:
+        override = CKPT_URL_OVERRIDES[ckpt_name]
+        if isinstance(override, dict):
+            urls.append((override["url"], override.get("file_name", ckpt_name)))
+        else:
+            for url in override:
+                urls.append((url, None))  # use URL's own basename
+    urls.extend(
+        (base_model_download_url + ckpt_name, None)
+        for base_model_download_url in BASE_MODEL_DOWNLOAD_URLS
+    )
+
+    model_dir = get_ckpt_container_path(model_type)
+    os.makedirs(model_dir, exist_ok=True)
+
+    for i, (url, file_name) in enumerate(urls):
         try:
-            return load_file_from_url(url, get_ckpt_container_path(model_type))
+            return load_file_from_url(url, model_dir, file_name=file_name)
         except Exception:
             traceback_str = traceback.format_exc()
-            if i < len(all_urls) - 1:
+            if i < len(urls) - 1:
                 print("Failed! Trying another endpoint.")
             error_strs.append(f"Error when downloading from: {url}\n\n{traceback_str}")
 
     error_str = '\n\n'.join(error_strs)
-    raise Exception(f"Tried all urls to download {ckpt_name} but no success. Below is the error log:\n\n{error_str}")
+    raise Exception(
+        f"Tried all download URLs for {ckpt_name} but none succeeded. "
+        f"Error log:\n\n{error_str}"
+    )
                 
 
 def load_file_from_direct_url(model_type, url):
